@@ -1,0 +1,48 @@
+Build V.34's probe table once for all threads.
+
+build_probe() filled a static table on first use and then set a flag. Two
+Asterisk channels starting V.34 at once both built it, and on a weakly
+ordered CPU (arm64) one could see the flag before the table. pthread_once,
+as v34_codec.c already does for its own tables.
+
+--- a/src/v34_dsp.c	2026-10-12 10:21:54
++++ b/src/v34_dsp.c	2026-10-12 10:30:09
+@@ -3,6 +3,7 @@
+ #include "datamodem/log.h"
+ 
+ #include <math.h>
++#include <pthread.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -216,12 +217,13 @@
+ static const bool PROBE_INVERT[V34_PROBE_TONES] = { 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0,
+                                                      1, 0, 1, 0, 1, 1, 1, 1, 0, 0 };
+ static float probe_table[V34_P2_BOX];
+-static bool probe_built;
++/* app_softmodem: built once for all threads, as v34_codec.c's tables are.
++   Two channels starting V.34 at once both built it, and on a weakly ordered
++   CPU one could see the flag before the table. */
++static pthread_once_t probe_once = PTHREAD_ONCE_INIT;
+ 
+-static void build_probe(void)
++static void build_probe_once(void)
+ {
+-    if (probe_built)
+-        return;
+     for (int n = 0; n < V34_P2_BOX; n++)
+     {
+         double s = 0.0;
+@@ -230,7 +232,11 @@
+             s += cos(2.0 * PI * V34_PROBE_HZ[k] * n / V34_FS + (PROBE_INVERT[k] ? PI : 0.0));
+         probe_table[n] = (float) s;
+     }
+-    probe_built = true;
++}
++
++static void build_probe(void)
++{
++    pthread_once(&probe_once, build_probe_once);
+ }
+ 
+ void v34_p2tx_init(v34_p2tx_t *t, bool answerer, double power_dbm0)

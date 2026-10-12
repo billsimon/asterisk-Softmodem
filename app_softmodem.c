@@ -2,9 +2,12 @@
  * Softmodem for Asterisk
  *
  * 2010, Christian Groeger <code@proquari.at>
- * 
+ *
  * Based on app_fax.c by Dmitry Andrianov <asterisk@dima.spb.ru>
  * and Steve Underwood <steveu@coppice.org>
+ *
+ * The data pump is datamodem's (https://github.com/billsimon/datamodem),
+ * vendored in engine/ - see engine/UPSTREAM.
  *
  * This program is free software, distributed under the terms of
  * the GNU General Public License
@@ -12,7 +15,7 @@
  */
 
 /*** MODULEINFO
-	 <depend>spandsp</depend>
+	<depend>spandsp</depend>
 	<support_level>extended</support_level>
 ***/
 
@@ -20,631 +23,451 @@
 #define ASTMM_LIBC ASTMM_IGNORE
 
 #include "asterisk.h"
-#include <string.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <inttypes.h>
-#include <pthread.h>
+
 #include <errno.h>
-#include <tiffio.h>
-#include <time.h>
+#include <stdlib.h>
+#include <string.h>
 
-#include <spandsp.h>
-#ifdef HAVE_SPANDSP_EXPOSE_H
-#include <spandsp/expose.h>
-#endif
-#include <spandsp/v22bis.h>
-
-#include "asterisk/file.h"
-#include "asterisk/module.h"
-#include "asterisk/channel.h"
-#include "asterisk/strings.h"
-#include "asterisk/lock.h"
 #include "asterisk/app.h"
-#include "asterisk/pbx.h"
+#include "asterisk/channel.h"
 #include "asterisk/format_cache.h"
+#include "asterisk/format_cap.h"
+#include "asterisk/frame.h"
 #include "asterisk/logger.h"
+#include "asterisk/module.h"
+#include "asterisk/pbx.h"
+#include "asterisk/strings.h"
+#include "asterisk/time.h"
 #include "asterisk/utils.h"
-#include "asterisk/dsp.h"
-#include "asterisk/manager.h"
 
-#ifndef AST_MODULE
-#define AST_MODULE "app_softmodem"
-#endif
+#include "softmodem/bridge.h"
 
 /*** DOCUMENTATION
 	<application name="Softmodem" language="en_US">
 		<synopsis>
-			A Softmodem that connects the caller to a Telnet server.
+			A data modem on the channel, connected to a TCP server.
 		</synopsis>
-		<syntax />
+		<syntax>
+			<parameter name="hostname">
+				<para>The server to connect the modem to. Default: localhost.</para>
+			</parameter>
+			<parameter name="port">
+				<para>Its TCP port. Default: 23.</para>
+			</parameter>
+			<parameter name="options">
+				<optionlist>
+					<option name="a">
+						<para>This is the answering modem: the far end called us.</para>
+					</option>
+					<option name="c">
+						<para>This is the calling modem: we called the far end.</para>
+						<para>Without <literal>a</literal> or <literal>c</literal> the modem answers,
+						unless the channel is one Asterisk placed (Originate, a call file, or the
+						called side of Dial), in which case it calls.</para>
+					</option>
+					<option name="v">
+						<argument name="modulation" required="true" />
+						<para>The fastest modulation to try: <literal>V34</literal> (the default),
+						<literal>V32bis</literal>, <literal>V32</literal>, <literal>V22bis</literal>,
+						<literal>V22</literal>, <literal>V21</literal>, <literal>Bell103</literal> or
+						<literal>V23</literal>. Below it, the modem falls back to whatever the far end
+						turns out to be. V23 (1200/75, as used by videotex) is never fallen back to and
+						has to be asked for.</para>
+					</option>
+					<option name="f">
+						<para>Fixed: only the modulation <literal>v</literal> names, no falling back.</para>
+					</option>
+					<option name="b">
+						<argument name="rate" required="true" />
+						<para>The highest bit rate to offer, e.g. <literal>2400</literal>.</para>
+					</option>
+					<option name="e">
+						<argument name="mode" required="true" />
+						<para>V.42 error correction: <literal>detect</literal> (the default: when the far end
+						will), <literal>off</literal>, or <literal>require</literal>. Never over V.21, Bell 103
+						or V.23.</para>
+					</option>
+					<option name="k">
+						<para>No V.42bis compression.</para>
+					</option>
+					<option name="d">
+						<argument name="bits" required="true" />
+						<para>Data bits, 5 to 8. Default: 8.</para>
+					</option>
+					<option name="p">
+						<argument name="parity" required="true" />
+						<para><literal>none</literal> (the default), <literal>even</literal> or
+						<literal>odd</literal>.</para>
+					</option>
+					<option name="s">
+						<argument name="bits" required="true" />
+						<para>Stop bits, 1 or 2. Default: 1.</para>
+					</option>
+					<option name="l">
+						<para>Least significant bit first (the default, and the standard).</para>
+					</option>
+					<option name="m">
+						<para>Most significant bit first.</para>
+					</option>
+					<option name="t">
+						<argument name="level" required="true" />
+						<para>Transmit level in dBm0. Default: -13.</para>
+					</option>
+					<option name="r">
+						<argument name="cutoff" required="true" />
+						<para>Accepted for compatibility and ignored.</para>
+					</option>
+					<option name="g">
+						<argument name="tone" required="true" />
+						<para>Guard tone for an answering V.22bis modem: <literal>550</literal> or
+						<literal>1800</literal>. Default: none.</para>
+					</option>
+					<option name="w">
+						<argument name="seconds" required="true" />
+						<para>Hang up if the modems have not trained in this long. Default: 45.</para>
+					</option>
+					<option name="u">
+						<para>Send the server an Ulm Relay Protocol header with the line speeds (Btx).</para>
+					</option>
+					<option name="n">
+						<para>Send a NUL down the line once connected (Btx).</para>
+					</option>
+				</optionlist>
+			</parameter>
+		</syntax>
 		<description>
-			<para>Softmodem(hostname,port,options):  Simulates a FSK(V.23) or V.22bis modem. The modem on the other end is connected to the specified server using a simple TCP connection (like Telnet).</para>
+			<para>Runs a data modem on the channel - V.34, V.32bis, V.32, V.22bis, V.22, V.21, Bell 103 or
+			V.23, with V.42 error correction and V.42bis compression - and connects what it carries to a TCP
+			server, as a telnet client would. The call ends when the far end's carrier goes or the server
+			closes the connection.</para>
+			<para>Use G.711 (ulaw or alaw) end to end, and switch off anything that alters the audio:
+			inband DTMF detection, fax detection, echo cancellation, jitter buffers that conceal loss.</para>
+			<para>This application sets the following channel variables:</para>
+			<variablelist>
+				<variable name="SOFTMODEM_RESULT">
+					<value name="SERVERCLOSED">The server closed the connection.</value>
+					<value name="CARRIERLOST">The far end's carrier went away.</value>
+					<value name="HANGUP">The channel hung up.</value>
+					<value name="NOCARRIER">The modems never trained.</value>
+					<value name="UNSTABLE">The link kept retraining.</value>
+					<value name="CONNECTFAILED">The server could not be reached.</value>
+					<value name="SOCKETERROR">The connection to the server failed.</value>
+					<value name="ERROR">Something else went wrong.</value>
+				</variable>
+				<variable name="SOFTMODEM_MODULATION">What the link ran, e.g. v32bis.</variable>
+				<variable name="SOFTMODEM_RATE">The bit rate received at.</variable>
+				<variable name="SOFTMODEM_TX_RATE">The bit rate sent at.</variable>
+				<variable name="SOFTMODEM_PROTOCOL">async, V.42 or V.42/V.42bis.</variable>
+				<variable name="SOFTMODEM_BYTES_SENT">Characters sent down the line.</variable>
+				<variable name="SOFTMODEM_BYTES_RECEIVED">Characters received from the line.</variable>
+			</variablelist>
 		</description>
 	</application>
  ***/
 
-/**
- * 	"Options:"
-	"  r(...): rx cutoff (dBi, float, default: -35)\n"
-	"  t(...): tx power (dBi, float, default: -28)\n"
-	"  v(...): modem version (default: V22bis):\n"
-	"            V21        - 300/300 baud\n"
-	"            V23        - 1200/75 baud\n"
-	"            Bell103    - 300/300 baud\n"
-	"            V22        - 1200/1200 baud\n"
-	"            V22bis     - 2400/2400 baud\n"
-	"  l or m: least or most significant bit first (default: l)\n"
-	"  d(...): amount of data bits (5-8, default: 8)\n"
-	"  s(...): amount of stop bits (1-2, default: 1)\n"
-	"  u:      Send ULM header to Telnet server (Btx)\n"
-	"  n:      Send NULL-Byte to modem after carrier detection (Btx)\n" 
-	"  c:      This is the calling modem (default)\n" 
-	"  a:      This is the answering modem\n" **/
-
 static const char app[] = "Softmodem";
 
 enum {
-	OPT_RX_CUTOFF =      (1 << 0),
-	OPT_TX_POWER =       (1 << 1),
-	OPT_MODEM_VERSION =  (1 << 2),
-	OPT_LSB_FIRST =      (1 << 3),
-	OPT_MSB_FIRST =      (1 << 4),
-	OPT_DATABITS =       (1 << 5),
-	OPT_STOPBITS =       (1 << 6),
-	OPT_ULM_HEADER =     (1 << 7),
-	OPT_NULL =           (1 << 8),
-	OPT_CALLER =         (1 << 9),
-	OPT_ANSWERER =       (1 << 10)
+	OPT_ANSWER =        (1 << 0),
+	OPT_CALL =          (1 << 1),
+	OPT_MODULATION =    (1 << 2),
+	OPT_FIXED =         (1 << 3),
+	OPT_BIT_RATE =      (1 << 4),
+	OPT_V42 =           (1 << 5),
+	OPT_NO_V42BIS =     (1 << 6),
+	OPT_DATABITS =      (1 << 7),
+	OPT_PARITY =        (1 << 8),
+	OPT_STOPBITS =      (1 << 9),
+	OPT_LSB_FIRST =     (1 << 10),
+	OPT_MSB_FIRST =     (1 << 11),
+	OPT_TX_POWER =      (1 << 12),
+	OPT_RX_CUTOFF =     (1 << 13),
+	OPT_GUARD_TONE =    (1 << 14),
+	OPT_TRAIN_TIMEOUT = (1 << 15),
+	OPT_ULM_HEADER =    (1 << 16),
+	OPT_NULL =          (1 << 17),
 };
 
 enum {
-	OPT_ARG_RX_CUTOFF,
-	OPT_ARG_TX_POWER,
-	OPT_ARG_MODEM_VERSION,
+	OPT_ARG_MODULATION,
+	OPT_ARG_BIT_RATE,
+	OPT_ARG_V42,
 	OPT_ARG_DATABITS,
+	OPT_ARG_PARITY,
 	OPT_ARG_STOPBITS,
+	OPT_ARG_TX_POWER,
+	OPT_ARG_RX_CUTOFF,
+	OPT_ARG_GUARD_TONE,
+	OPT_ARG_TRAIN_TIMEOUT,
 
 	/* Must be the last element */
 	OPT_ARG_ARRAY_SIZE,
 };
 
 AST_APP_OPTIONS(additional_options, BEGIN_OPTIONS
-	AST_APP_OPTION_ARG('r', OPT_RX_CUTOFF, OPT_ARG_RX_CUTOFF),
-	AST_APP_OPTION_ARG('t', OPT_TX_POWER, OPT_ARG_TX_POWER),
-	AST_APP_OPTION_ARG('v', OPT_MODEM_VERSION, OPT_ARG_MODEM_VERSION),
+	AST_APP_OPTION('a', OPT_ANSWER),
+	AST_APP_OPTION('c', OPT_CALL),
+	AST_APP_OPTION_ARG('v', OPT_MODULATION, OPT_ARG_MODULATION),
+	AST_APP_OPTION('f', OPT_FIXED),
+	AST_APP_OPTION_ARG('b', OPT_BIT_RATE, OPT_ARG_BIT_RATE),
+	AST_APP_OPTION_ARG('e', OPT_V42, OPT_ARG_V42),
+	AST_APP_OPTION('k', OPT_NO_V42BIS),
+	AST_APP_OPTION_ARG('d', OPT_DATABITS, OPT_ARG_DATABITS),
+	AST_APP_OPTION_ARG('p', OPT_PARITY, OPT_ARG_PARITY),
+	AST_APP_OPTION_ARG('s', OPT_STOPBITS, OPT_ARG_STOPBITS),
 	AST_APP_OPTION('l', OPT_LSB_FIRST),
 	AST_APP_OPTION('m', OPT_MSB_FIRST),
-	AST_APP_OPTION_ARG('d', OPT_DATABITS, OPT_ARG_DATABITS),
-	AST_APP_OPTION_ARG('s', OPT_STOPBITS, OPT_ARG_STOPBITS),
+	AST_APP_OPTION_ARG('t', OPT_TX_POWER, OPT_ARG_TX_POWER),
+	AST_APP_OPTION_ARG('r', OPT_RX_CUTOFF, OPT_ARG_RX_CUTOFF),
+	AST_APP_OPTION_ARG('g', OPT_GUARD_TONE, OPT_ARG_GUARD_TONE),
+	AST_APP_OPTION_ARG('w', OPT_TRAIN_TIMEOUT, OPT_ARG_TRAIN_TIMEOUT),
 	AST_APP_OPTION('u', OPT_ULM_HEADER),
 	AST_APP_OPTION('n', OPT_NULL),
-	AST_APP_OPTION('c', OPT_CALLER),
-	AST_APP_OPTION('a', OPT_ANSWERER),
 END_OPTIONS );
 
-
-#define MAX_SAMPLES 240
-
-enum {
-	VERSION_V21,
-	VERSION_V23,
-	VERSION_BELL103,
-	VERSION_V22,
-	VERSION_V22BIS,
+/* Each option's letter, flag and argument slot (-1 for none), in the order
+ * they are applied - which only matters for l/m and a/c, refused together. */
+static const struct {
+	char letter;
+	unsigned int flag;
+	int arg;
+} option_table[] = {
+	{ 'a', OPT_ANSWER, -1 },
+	{ 'c', OPT_CALL, -1 },
+	{ 'v', OPT_MODULATION, OPT_ARG_MODULATION },
+	{ 'f', OPT_FIXED, -1 },
+	{ 'b', OPT_BIT_RATE, OPT_ARG_BIT_RATE },
+	{ 'e', OPT_V42, OPT_ARG_V42 },
+	{ 'k', OPT_NO_V42BIS, -1 },
+	{ 'd', OPT_DATABITS, OPT_ARG_DATABITS },
+	{ 'p', OPT_PARITY, OPT_ARG_PARITY },
+	{ 's', OPT_STOPBITS, OPT_ARG_STOPBITS },
+	{ 'l', OPT_LSB_FIRST, -1 },
+	{ 'm', OPT_MSB_FIRST, -1 },
+	{ 't', OPT_TX_POWER, OPT_ARG_TX_POWER },
+	{ 'r', OPT_RX_CUTOFF, OPT_ARG_RX_CUTOFF },
+	{ 'g', OPT_GUARD_TONE, OPT_ARG_GUARD_TONE },
+	{ 'w', OPT_TRAIN_TIMEOUT, OPT_ARG_TRAIN_TIMEOUT },
+	{ 'u', OPT_ULM_HEADER, -1 },
+	{ 'n', OPT_NULL, -1 },
 };
 
-typedef struct {
-	struct ast_channel *chan;
-	const char *host;	//telnetd host+port
-	int port;
-	float txpower;
-	float rxcutoff;
-	int version;
-	int lsb;
-	int databits;
-	int stopbits;
-	int ulmheader;
-	int sendnull;
-	int caller;
-	volatile int finished;
-} modem_session;
+/* How long to wait for the server to accept the connection. */
+#define SOFTMODEM_CONNECT_TIMEOUT_MS 10000
 
-#define MODEM_BITBUFFER_SIZE 16
-typedef struct {
-	int answertone;		// terminal is active (=sends data)
-	int nulsent;		// we sent a NULL as very first character (at least the DBT03 expects this)
-} connection_state;
-typedef struct {
-	int sock;
-	int bitbuffer[MODEM_BITBUFFER_SIZE];
-	int writepos;
-	int readpos;
-	int fill;
-	connection_state *state;
-	modem_session *session;
-} modem_data;
+/* Room for a frame and the biggest gap the clock will fill at once. */
+#define SOFTMODEM_OUT_SAMPLES (SM_MAX_GAP_SAMPLES + 2 * SM_SAMPLE_RATE / 10)
 
+/* ------------------------------------------------------------------ logging */
 
-// this is called by spandsp whenever it filtered a new bit from the line
-static void modem_put_bit(void *user_data, int bit) {
-	int stop, stop2, i;
-	
-	modem_data *rx = (modem_data*) user_data;
-	
-	int databits = rx->session->databits;
-	int stopbits = rx->session->stopbits;
-	
-	// modem recognised us and starts responding through sending it's pilot signal
-	if (rx->state->answertone<=0) {
-		if (bit==SIG_STATUS_CARRIER_UP) { 
-			ast_debug(1, "Carrier up, setting answertone = 0\n");
-			rx->state->answertone=0;
-		}
-		if (rx->session->version == VERSION_V22 || rx->session->version == VERSION_V22BIS) {
-			if (bit==SIG_STATUS_TRAINING_SUCCEEDED && rx->state->answertone==0) {
-				ast_debug(1, "V22 training succeeded, setting answertone = 1\n");
-				rx->state->answertone=1;
-				if (rx->session->caller) send(rx->sock, "CONNECTED\r\n", 11, 0);
-			}
-		} else {
-			if (bit==1 && rx->state->answertone==0) {
-				ast_debug(1, "Non-V22 started to receive data, setting answertone = 1\n");
-				rx->state->answertone=1;
-				if (rx->session->caller) send(rx->sock, "CONNECTED\r\n", 11, 0);
-			}
-		}
-	}
-	else {
-		// ignore other spandsp-stuff
-		if (bit==1 || bit==0) {
-			
-			// insert bit into our bitbuffer
-			rx->bitbuffer[rx->writepos]=bit;
-			rx->writepos++;
-			if (rx->writepos>=MODEM_BITBUFFER_SIZE) rx->writepos=0;
-			
-			if (rx->fill<MODEM_BITBUFFER_SIZE) {
-				rx->fill++;
-			} else { 
-				// our bitbuffer is full, this probably won't happen
-	// 			printf("full buffer\n");
-				rx->readpos++;
-				if (rx->readpos>=MODEM_BITBUFFER_SIZE) rx->readpos=0;
-			}
-			
-			// full byte = 1 startbit + databits + stopbits
-			while (rx->fill>=(1+databits+stopbits)) {
-				if (rx->bitbuffer[rx->readpos]==0) {	// check for startbit
-					stop=(rx->readpos+1+databits)%MODEM_BITBUFFER_SIZE;
-					stop2=(rx->readpos+2+databits)%MODEM_BITBUFFER_SIZE;
-					if ( (rx->bitbuffer[stop]==1) &&
-						(stopbits==1 || (stopbits==2 && rx->bitbuffer[stop2]==1)) )
-					{	// check for stopbit -> valid framing
-						char byte=0;
-						
-						for(i=0; i<databits; i++) {	// generate byte
-							if (rx->session->lsb) { //lsb first
-								if (rx->bitbuffer[(rx->readpos+1+i)%MODEM_BITBUFFER_SIZE])
-									byte |= (1<<i);
-							} else { //msb first
-								if (rx->bitbuffer[(rx->readpos+databits-i)%MODEM_BITBUFFER_SIZE])
-									byte |= (1<<i);
-							}
-						}
-						
-						send(rx->sock, &byte, 1, 0);
-						
-						rx->readpos=(rx->readpos+10)%MODEM_BITBUFFER_SIZE;
-						rx->fill-=10;
-						
-					} else {	// no valid framing (no stopbit), remove first bit and maybe try again
-						rx->fill--;
-						rx->readpos++;
-						rx->readpos %= MODEM_BITBUFFER_SIZE;
-					}
-				} else {	// no valid framing either (no startbit)
-					rx->fill--;
-					rx->readpos++;
-					rx->readpos %= MODEM_BITBUFFER_SIZE;
-				}
-			}
-		}
-		else {
-			ast_debug(1, "Received a non 1 or 0 bit: %d\n", bit);
-		}
-	}
-	
-	
-	
-	return;
-}
-
-// spandsp asks us for a bit to send onto the line
-static int modem_get_bit(void *user_data) {
-	modem_data *tx = (modem_data*) user_data;
-	char byte=0;
-	int i, rc;
-	
-	int databits=tx->session->databits;
-	int stopbits=tx->session->stopbits;
-	
-	// no new data in send (bit)buffer, 
-	// either we just picked up the line, the terminal started to respond,
-	// than we check for new data on the socket
-	// or there's no new data, so we send 1s (mark)
-	if (tx->writepos==tx->readpos) {
-		if(tx->state->nulsent>0) {	// connection is established, look for data on socket
-			rc=recv(tx->sock,&byte, 1, 0);
-			if (rc>0) {
-				// new data on socket, we put that byte into our bitbuffer
-				for (i=0; i<(databits+stopbits); i++) {
-					if (i>=databits) tx->bitbuffer[tx->writepos]=1;	// stopbits
-					else {	// databits
-						if (tx->session->lsb) {
-							if (byte & (1<<i)) tx->bitbuffer[tx->writepos]=1;
-							else tx->bitbuffer[tx->writepos]=0;
-						} else {
-							if (byte & (1<<(databits-1-i))) tx->bitbuffer[tx->writepos]=1;
-							else tx->bitbuffer[tx->writepos]=0;
-						}
-					}
-					tx->writepos++;
-					if (tx->writepos>=MODEM_BITBUFFER_SIZE) tx->writepos=0;
-				}
-				return 0; // return startbit immediately
-			}
-			else if (rc==0) {
-				ast_log(LOG_WARNING,"Socket seems closed. Will hangup.\n");
-				tx->session->finished=1;
-			}
-		}
-		else {
-			// check if socket was closed before connection was terminated
-			if ( recv(tx->sock,&byte, 1, MSG_PEEK) == 0 ) {
-				tx->session->finished=1;
-				return 1;
-			}
-			if ( tx->state->answertone>0 ) {
-				
-				if (tx->session->sendnull) { // send null byte
-					for (i=0; i<(databits+stopbits); i++) {
-						if (i>=databits) tx->bitbuffer[tx->writepos]=1;	//stopbits
-						else tx->bitbuffer[tx->writepos]=0; //databits
-						tx->writepos++;
-						if (tx->writepos>=MODEM_BITBUFFER_SIZE) tx->writepos=0;
-					}
-				}
-				tx->state->nulsent=1;
-				
-				if (tx->session->ulmheader) {
-					// send ULM relay protocol header, include connection speed
-					float tx_baud,rx_baud;
-					if (tx->session->version==VERSION_V21) {
-						tx_baud=300;
-						rx_baud=300;
-					} else if (tx->session->version==VERSION_V23) {
-						tx_baud=1200;
-						rx_baud=75;
-					} else if (tx->session->version==VERSION_BELL103) {
-						tx_baud=300;
-						rx_baud=300;
-					} else if (tx->session->version==VERSION_V22) {
-						tx_baud=1200;
-						rx_baud=1200;
-					} else if (tx->session->version==VERSION_V22BIS) {
-						tx_baud=2400;
-						rx_baud=2400;
-					} else {
-						tx_baud=0;
-						rx_baud=0;
-					}
-					
-					char header[60];
-					int headerlength=sprintf(header, 
-						"Version: 1\r\nTXspeed: %.2f\r\nRXspeed: %.2f\r\n\r\n",
-						tx_baud/(1+databits+stopbits), rx_baud/(1+databits+stopbits));
-					send(tx->sock, header, headerlength, 0);
-				}
-				
-				if (tx->session->sendnull)
-					return 0;
-				else
-					return 1;
-			}
-		}
-		
-		// no new data on socket, NULL-byte already sent, send mark-frequency 
-		return 1;
-		
-	} else {
-		// there still is data in the bitbuffer, so we just send that out
-		i=tx->bitbuffer[tx->readpos];
-		tx->readpos++;
-		if (tx->readpos>=MODEM_BITBUFFER_SIZE) tx->readpos=0;
-// 		printf("b%i",i);
-		return i;
-	}
-}
-
-static void *modem_generator_alloc(struct ast_channel *chan, void *params)
+static void ast_sink(dm_log_level_t level, const char *component, const char *msg)
 {
-	return params;
+	switch (level) {
+	case DM_LOG_ERROR:
+		ast_log(LOG_ERROR, "[%s] %s\n", component, msg);
+		break;
+	case DM_LOG_WARN:
+		ast_log(LOG_WARNING, "[%s] %s\n", component, msg);
+		break;
+	case DM_LOG_INFO:
+		ast_verb(3, "Softmodem [%s] %s\n", component, msg);
+		break;
+	case DM_LOG_DEBUG:
+		ast_debug(1, "[%s] %s\n", component, msg);
+		break;
+	default:
+		ast_debug(4, "[%s] %s\n", component, msg);
+		break;
+	}
 }
 
-static int fsk_generator_generate(struct ast_channel *chan, void *data, int len, int samples)
+static bool ast_enabled(dm_log_level_t level)
 {
-	fsk_tx_state_t *tx = (fsk_tx_state_t*) data;
-	uint8_t buffer[AST_FRIENDLY_OFFSET + MAX_SAMPLES * sizeof(uint16_t)];
-	int16_t *buf = (int16_t *) (buffer + AST_FRIENDLY_OFFSET);
-	
-	struct ast_frame outf = {
-		.frametype = AST_FRAME_VOICE,
-		.subclass.format = ast_format_slin,
-		.src = __FUNCTION__,
-	};
-
-	if (samples > MAX_SAMPLES) {
-		ast_log(LOG_WARNING, "Only generating %d samples, where %d requested\n", MAX_SAMPLES, samples);
-		samples = MAX_SAMPLES;
+	switch (level) {
+	case DM_LOG_ERROR:
+	case DM_LOG_WARN:
+		return true;
+	case DM_LOG_INFO:
+		return VERBOSITY_ATLEAST(3);
+	case DM_LOG_DEBUG:
+		return DEBUG_ATLEAST(1);
+	default:
+		return DEBUG_ATLEAST(4);
 	}
+}
 
-	
-	if ((len = fsk_tx(tx, buf, samples)) > 0) {
-		outf.samples = len;
-		AST_FRAME_SET_BUFFER(&outf, buffer, AST_FRIENDLY_OFFSET, len * sizeof(int16_t));
+/* ------------------------------------------------------------------ channel */
 
-		if (ast_write(chan, &outf) < 0) {
+static int write_audio(struct ast_channel *chan, const int16_t *samples, int n, int frame_samples)
+{
+	uint8_t buffer[AST_FRIENDLY_OFFSET + SM_SAMPLE_RATE / 10 * sizeof(int16_t)];
+	int max = SM_SAMPLE_RATE / 10;
+
+	if (frame_samples <= 0 || frame_samples > max)
+		frame_samples = SM_SAMPLE_RATE / 50;
+	/* In frames the size of the far end's, so that a gap filled in one go
+	 * goes out as the packets it stands for. */
+	while (n > 0) {
+		int len = n < frame_samples ? n : frame_samples;
+		struct ast_frame f = {
+			.frametype = AST_FRAME_VOICE,
+			.src = app,
+		};
+
+		f.subclass.format = ast_format_slin;
+		memcpy(buffer + AST_FRIENDLY_OFFSET, samples, len * sizeof(int16_t));
+		f.samples = len;
+		AST_FRAME_SET_BUFFER(&f, buffer, AST_FRIENDLY_OFFSET, len * sizeof(int16_t));
+		if (ast_write(chan, &f) < 0) {
 			ast_log(LOG_WARNING, "Failed to write frame to %s: %s\n", ast_channel_name(chan), strerror(errno));
 			return -1;
 		}
+		samples += len;
+		n -= len;
 	}
-
 	return 0;
 }
 
-
-static int v22_generator_generate(struct ast_channel *chan, void *data, int len, int samples)
+/* Anything that listens to the audio for tones of its own - DTMF, fax - can
+ * mistake a modem for one and mute or divert the call, and an echo canceller
+ * fights V.32's and V.34's own. Channel drivers that can switch these off do
+ * it here (DAHDI); the rest have to be configured not to. */
+static void set_dsp(struct ast_channel *chan, int on)
 {
-	v22bis_state_t *tx = (v22bis_state_t*) data;
-	uint8_t buffer[AST_FRIENDLY_OFFSET + MAX_SAMPLES * sizeof(uint16_t)];
-	int16_t *buf = (int16_t *) (buffer + AST_FRIENDLY_OFFSET);
-	
-	struct ast_frame outf = {
-		.frametype = AST_FRAME_VOICE,
-		.subclass.format = ast_format_slin,
-		.src = __FUNCTION__,
-	};
+	char v = on ? 1 : 0;
 
-	if (samples > MAX_SAMPLES) {
-		ast_log(LOG_WARNING, "Only generating %d samples, where %d requested\n", MAX_SAMPLES, samples);
-		samples = MAX_SAMPLES;
+	ast_channel_setoption(chan, AST_OPTION_DIGIT_DETECT, &v, sizeof(v), 0);
+	if (!on) {
+		ast_channel_setoption(chan, AST_OPTION_FAX_DETECT, &v, sizeof(v), 0);
+		ast_channel_setoption(chan, AST_OPTION_ECHOCAN, &v, sizeof(v), 0);
 	}
-
-	
-	if ((len = v22bis_tx(tx, buf, samples)) > 0) {
-		outf.samples = len;
-		AST_FRAME_SET_BUFFER(&outf, buffer, AST_FRIENDLY_OFFSET, len * sizeof(int16_t));
-
-		if (ast_write(chan, &outf) < 0) {
-			ast_log(LOG_WARNING, "Failed to write frame to %s: %s\n", ast_channel_name(chan), strerror(errno));
-			return -1;
-		}
-	}
-
-	return 0;
 }
 
-struct ast_generator fsk_generator = {
-	alloc:		modem_generator_alloc,
-	generate: 	fsk_generator_generate,
-};
-struct ast_generator v22_generator = {
-	alloc:		modem_generator_alloc,
-	generate: 	v22_generator_generate,
-};
+/* Modems need the audio as it was sent; a codec that compresses it destroys
+ * anything faster than a fraction of 300 bps. */
+static void check_codec(struct ast_channel *chan)
+{
+	struct ast_format_cap *caps = ast_channel_nativeformats(chan);
 
-static int softmodem_communicate(modem_session *s) {
-	int res = -1;
-	struct ast_format *original_read_fmt;
-	struct ast_format *original_write_fmt;
-	
-	modem_data rxdata, txdata;
-	
-	struct ast_frame *inf = NULL;
-	
-	fsk_tx_state_t *modem_tx;
-	fsk_rx_state_t *modem_rx;
-	
-	v22bis_state_t *v22_modem;
-	
-	
-	original_read_fmt = ast_channel_readformat(s->chan);
-	if (original_read_fmt != ast_format_slin) {
-		res=ast_set_read_format(s->chan, ast_format_slin);
-		if (res < 0) {
-			ast_log(LOG_WARNING, "Unable to set to linear read mode, giving up\n");
-			return res;
-		}
-	}
+	if (caps == NULL)
+		return;
+	if (ast_format_cap_iscompatible_format(caps, ast_format_ulaw) == AST_FORMAT_CMP_NOT_EQUAL &&
+	    ast_format_cap_iscompatible_format(caps, ast_format_alaw) == AST_FORMAT_CMP_NOT_EQUAL &&
+	    ast_format_cap_iscompatible_format(caps, ast_format_slin) == AST_FORMAT_CMP_NOT_EQUAL) {
+		struct ast_str *names = ast_str_alloca(AST_FORMAT_CAP_NAMES_LEN);
 
-	original_write_fmt = ast_channel_writeformat(s->chan);
-	if (original_write_fmt != ast_format_slin) {
-		res=ast_set_write_format(s->chan, ast_format_slin);
-		if (res < 0) {
-			ast_log(LOG_WARNING, "Unable to set to linear write mode, giving up\n");
-			return res;
-		}
+		ast_log(LOG_WARNING, "%s is using %s; a modem needs G.711 (ulaw or alaw) end to end\n",
+			ast_channel_name(chan), ast_format_cap_get_names(caps, &names));
 	}
-	
-	int sock;
-	struct sockaddr_in server;
-	struct hostent *hp;
-	struct ast_hostent ahp;
-	
-	sock = socket(AF_INET, SOCK_STREAM, 0);
-	if(sock < 0) {
-		ast_log(LOG_WARNING, "Could not create socket.\n");
-		return res;
-	}
-	
-	server.sin_family=AF_INET;
-	hp=ast_gethostbyname(s->host, &ahp);
-	memcpy( (char *)&server.sin_addr, hp->h_addr, hp->h_length);
-	//bcopy ( hp->h_addr, &(server.sin_addr.s_addr), hp->h_length);
-	server.sin_port=htons(s->port);
-	
-	if (connect(sock, (struct sockaddr*)&server, sizeof(server)) < 0) {
-		ast_log(LOG_WARNING, "Cannot connect to remote host.\n");
-		return res;
-	}
-	
-	fcntl(sock, F_SETFL, O_NONBLOCK);
-	
-	
-	connection_state state;
-	state.answertone=-1;	//no carrier yet
-	state.nulsent=0;
-	
-	rxdata.sock=sock;
-	rxdata.writepos=0;
-	rxdata.readpos=0;
-	rxdata.fill=0;
-	rxdata.state= &state;
-	rxdata.session=s;
-	
-	txdata.sock=sock;
-	txdata.writepos=0;
-	txdata.readpos=0;
-	txdata.fill=0;
-	txdata.state= &state;
-	txdata.session=s;
-	
-	// initialise spandsp-stuff, give it our callback-functions
-	if (s->version==VERSION_V21) {
-		ast_debug(1, "Initializing V21\n");
-		if (s->caller) {
-			modem_tx = fsk_tx_init(NULL, &preset_fsk_specs[FSK_V21CH2], modem_get_bit, &txdata);
-			modem_rx = fsk_rx_init(NULL, &preset_fsk_specs[FSK_V21CH1], TRUE, modem_put_bit, &rxdata);
-		} else {
-			modem_tx = fsk_tx_init(NULL, &preset_fsk_specs[FSK_V21CH1], modem_get_bit, &txdata);
-			modem_rx = fsk_rx_init(NULL, &preset_fsk_specs[FSK_V21CH2], TRUE, modem_put_bit, &rxdata);
-		}
-	}
-	else if (s->version==VERSION_V23) {
-		ast_debug(1, "Initializing V23\n");
-		if (s->caller) {
-			modem_tx = fsk_tx_init(NULL, &preset_fsk_specs[FSK_V23CH2], modem_get_bit, &txdata);
-			modem_rx = fsk_rx_init(NULL, &preset_fsk_specs[FSK_V23CH1], TRUE, modem_put_bit, &rxdata);
-		} else {
-			modem_tx = fsk_tx_init(NULL, &preset_fsk_specs[FSK_V23CH1], modem_get_bit, &txdata);
-			modem_rx = fsk_rx_init(NULL, &preset_fsk_specs[FSK_V23CH2], TRUE, modem_put_bit, &rxdata);
-		}	
-	}
-	else if (s->version==VERSION_BELL103) {
-		ast_debug(1, "Initializing Bell103\n");
-		if (s->caller) {
-			modem_tx = fsk_tx_init(NULL, &preset_fsk_specs[FSK_BELL103CH2], modem_get_bit, &txdata);
-			modem_rx = fsk_rx_init(NULL, &preset_fsk_specs[FSK_BELL103CH1], FALSE, modem_put_bit, &rxdata);
-		} else {
-			modem_tx = fsk_tx_init(NULL, &preset_fsk_specs[FSK_BELL103CH1], modem_get_bit, &txdata);
-			modem_rx = fsk_rx_init(NULL, &preset_fsk_specs[FSK_BELL103CH2], FALSE, modem_put_bit, &rxdata);
-		}
-	}
-	else if (s->version==VERSION_V22) {
-		ast_debug(1, "Initializing V22\n");
-		v22_modem = v22bis_init(NULL, 1200, 0, s->caller, modem_get_bit, &txdata, modem_put_bit, &rxdata);
-	}
-	else if (s->version==VERSION_V22BIS) {
-		ast_debug(1, "Initializing V22bis\n");
-		v22_modem = v22bis_init(NULL, 2400, 0, s->caller, modem_get_bit, &txdata, modem_put_bit, &rxdata);
-	}
-	else {
-		ast_log(LOG_ERROR,"Unsupported modem type. Sorry.\n");
-		return res;
-	}
-	
-	if (s->version==VERSION_V21 || s->version==VERSION_V23 || s->version==VERSION_BELL103) {
-		fsk_tx_power (modem_tx, s->txpower);
-		fsk_rx_signal_cutoff(modem_rx, s->rxcutoff);
-	}
-	else if (s->version==VERSION_V22 || s->version==VERSION_V22BIS) {
-		v22bis_tx_power(v22_modem, s->txpower);
-		v22bis_rx_signal_cutoff(v22_modem, s->rxcutoff);
-	}
-	
-	//printf("comm: baud %i\n",btx_tx->baud_rate);
-	if (s->version==VERSION_V21 || s->version==VERSION_V23 || s->version==VERSION_BELL103)
-		ast_activate_generator(s->chan, &fsk_generator, modem_tx);
-	else if (s->version==VERSION_V22 || s->version==VERSION_V22BIS)
-		ast_activate_generator(s->chan, &v22_generator, v22_modem);
-	
-	while (!s->finished) {
-		res = ast_waitfor(s->chan, 20);
-		if (res < 0)
-			break;
-		else if (res > 0)
-			res = 0;
+}
 
-		inf = ast_read(s->chan);
-		if (inf == NULL) {
-			ast_debug(1, "Channel hangup\n");
+static void set_result(struct ast_channel *chan, const char *result, sm_bridge_t *b)
+{
+	char num[32];
+
+	pbx_builtin_setvar_helper(chan, "SOFTMODEM_RESULT", result);
+	if (b == NULL)
+		return;
+	{
+		sm_status_t st;
+
+		sm_bridge_status(b, &st);
+		pbx_builtin_setvar_helper(chan, "SOFTMODEM_MODULATION", st.connected ? st.modulation : "");
+		pbx_builtin_setvar_helper(chan, "SOFTMODEM_PROTOCOL", st.connected ? st.protocol : "");
+		snprintf(num, sizeof(num), "%d", st.connected ? st.rx_rate : 0);
+		pbx_builtin_setvar_helper(chan, "SOFTMODEM_RATE", num);
+		snprintf(num, sizeof(num), "%d", st.connected ? st.tx_rate : 0);
+		pbx_builtin_setvar_helper(chan, "SOFTMODEM_TX_RATE", num);
+		snprintf(num, sizeof(num), "%llu", (unsigned long long) st.bytes_to_line);
+		pbx_builtin_setvar_helper(chan, "SOFTMODEM_BYTES_SENT", num);
+		snprintf(num, sizeof(num), "%llu", (unsigned long long) st.bytes_from_line);
+		pbx_builtin_setvar_helper(chan, "SOFTMODEM_BYTES_RECEIVED", num);
+	}
+}
+
+static int64_t now_ms(void)
+{
+	struct timeval tv = ast_tvnow();
+
+	return (int64_t) tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/* The call itself: audio in, audio out, bytes to and from the server.
+ * Returns -1 if the channel hung up, else 0. */
+static int softmodem_run(struct ast_channel *chan, sm_bridge_t *b)
+{
+	int16_t *out;
+	sm_clock_t clock;
+	int frame_samples = SM_SAMPLE_RATE / 50;
+	int res = 0;
+
+	out = ast_malloc(SOFTMODEM_OUT_SAMPLES * sizeof(int16_t));
+	if (out == NULL) {
+		sm_bridge_set_end(b, SM_END_ERROR);
+		return 0;
+	}
+	sm_clock_init(&clock, now_ms());
+
+	for (;;) {
+		struct ast_frame *f;
+		int n = 0;
+		int ready = ast_waitfor(chan, 20);
+
+		if (ready < 0) {
+			sm_bridge_set_end(b, SM_END_HANGUP);
 			res = -1;
 			break;
 		}
-		
-		/* Check the frame type. Format also must be checked because there is a chance
-		   that a frame in old format was already queued before we set chanel format
-		   to slinear so it will still be received by ast_read */
-		if (inf->frametype == AST_FRAME_VOICE && inf->subclass.format == ast_format_slin) {
-			if (s->version==VERSION_V21 || s->version==VERSION_V23 || s->version==VERSION_BELL103) {
-				if (fsk_rx(modem_rx, inf->data.ptr, inf->samples) < 0) {
-					/* I know fax_rx never returns errors. The check here is for good style only */
-					ast_log(LOG_WARNING, "softmodem returned error\n");
-					res = -1;
-					break;
-				}
+		if (ready > 0) {
+			f = ast_read(chan);
+			if (f == NULL) {
+				ast_debug(1, "%s hung up\n", ast_channel_name(chan));
+				sm_bridge_set_end(b, SM_END_HANGUP);
+				res = -1;
+				break;
 			}
-			else if (s->version==VERSION_V22 || s->version==VERSION_V22BIS) {
-				if (v22bis_rx(v22_modem, inf->data.ptr, inf->samples) < 0) {
-					ast_log(LOG_WARNING, "softmodem returned error\n");
-					res = -1;
-					break;
-				}
+			/* The format has to be checked as well: a frame in the old one
+			 * may have been queued before the channel was switched to
+			 * signed linear. */
+			if (f->frametype == AST_FRAME_VOICE &&
+			    ast_format_cmp(f->subclass.format, ast_format_slin) == AST_FORMAT_CMP_EQUAL &&
+			    f->samples > 0 && f->samples <= SM_SAMPLE_RATE / 10 && f->data.ptr != NULL) {
+				int seq = ast_test_flag(f, AST_FRFLAG_HAS_TIMING_INFO) ? (f->seqno & 0xffff) : -1;
+
+				frame_samples = f->samples;
+				n = sm_clock_frame(&clock, b, f->data.ptr, f->samples, seq, now_ms(), out,
+						   SOFTMODEM_OUT_SAMPLES);
 			}
+			ast_frfree(f);
 		}
-		
-		ast_frfree(inf);
-		inf = NULL;
+		if (n == 0)
+			n = sm_clock_idle(&clock, b, now_ms(), out, SOFTMODEM_OUT_SAMPLES);
+		if (n > 0 && write_audio(chan, out, n, frame_samples) < 0) {
+			sm_bridge_set_end(b, SM_END_HANGUP);
+			res = -1;
+			break;
+		}
+		if (sm_bridge_service(b) != SM_RUNNING)
+			break;
 	}
-	
-	close(sock);
-	
-	if (s->version==VERSION_V22 || s->version==VERSION_V22BIS) {
-		v22bis_release(v22_modem);
-		v22bis_free(v22_modem);
-	}
-	
-	if (original_write_fmt != ast_format_slin) {
-		if (ast_set_write_format(s->chan, original_write_fmt) < 0)
-			ast_log(LOG_WARNING, "Unable to restore write format on '%s'\n", ast_channel_name(s->chan));
-	}
-
-	if (original_read_fmt != ast_format_slin) {
-		if (ast_set_read_format(s->chan, original_read_fmt) < 0)
-			ast_log(LOG_WARNING, "Unable to restore read format on '%s'\n", ast_channel_name(s->chan));
-	}
-
+	ast_free(out);
 	return res;
-
 }
 
-static int softmodem_exec(struct ast_channel *chan, const char *data) {
-	int res = 0;
+static int softmodem_exec(struct ast_channel *chan, const char *data)
+{
 	char *parse;
-	modem_session session;
-	struct ast_flags options = { 0, };
-	char *option_args[OPT_ARG_ARRAY_SIZE];
+	char err[256];
+	struct ast_flags flags = { 0, };
+	char *option_args[OPT_ARG_ARRAY_SIZE] = { NULL, };
+	sm_options_t opts;
+	const char *host = "localhost";
+	int port = 23;
+	bool calling;
+	struct ast_format *read_fmt = NULL, *write_fmt = NULL;
+	sm_bridge_t *b = NULL;
+	int sock;
+	int res = 0;
 
 	AST_DECLARE_APP_ARGS(args,
 		AST_APP_ARG(host);
@@ -656,134 +479,145 @@ static int softmodem_exec(struct ast_channel *chan, const char *data) {
 		ast_log(LOG_ERROR, "Channel is NULL. Giving up.\n");
 		return -1;
 	}
-	
-	/* answer channel if not already answered */
-	if (ast_channel_state(chan) != AST_STATE_UP) {
-		res = ast_answer(chan);
-		if (res) {
-			ast_log(LOG_WARNING, "Could not answer channel '%s'\n", ast_channel_name(chan));
-			return res;
-		}
-	}
-	
-	session.chan=chan;
-	session.finished=0;
-	session.rxcutoff=-35.0f;
-	session.txpower=-28.0f;
-	session.version=VERSION_V22BIS;
-	session.lsb=1;
-	session.databits=8;
-	session.stopbits=1;
-	session.ulmheader=0;
-	session.sendnull=0;
-	session.caller=1;
-	
-	parse=ast_strdupa(data);
-	AST_STANDARD_APP_ARGS(args,parse);
-	
-	if (args.host)
-		session.host=args.host;
-	else
-		session.host="localhost";
-	
-	if (args.port) {
-		session.port=atoi(args.port);
-		if ((session.port<0) || (session.port>65535)) {
+
+	parse = ast_strdupa(S_OR(data, ""));
+	AST_STANDARD_APP_ARGS(args, parse);
+
+	if (!ast_strlen_zero(args.host))
+		host = ast_strip(args.host);
+	if (!ast_strlen_zero(args.port)) {
+		if (sscanf(args.port, "%30d", &port) != 1 || port <= 0 || port > 65535) {
 			ast_log(LOG_ERROR, "Please specify a valid port number.\n");
 			return -1;
 		}
-	} else
-		session.port=23;
-	
-	
-	if (args.options) {
-		ast_app_parse_options(additional_options, &options, option_args, args.options);
-		
-		if (ast_test_flag(&options, OPT_RX_CUTOFF)) {
-			if (!ast_strlen_zero(option_args[OPT_ARG_RX_CUTOFF]))
-				session.rxcutoff=atof(option_args[OPT_ARG_RX_CUTOFF]);
-		}
-		
-		if (ast_test_flag(&options, OPT_TX_POWER)) {
-			if (!ast_strlen_zero(option_args[OPT_ARG_TX_POWER]))
-				session.txpower=atof(option_args[OPT_ARG_TX_POWER]);
-		}
-		
-		if (ast_test_flag(&options, OPT_MODEM_VERSION)) {
-			if (!ast_strlen_zero(option_args[OPT_ARG_MODEM_VERSION])) {
-				ast_debug(1, "Modem version from args is %s\n", option_args[OPT_ARG_MODEM_VERSION]);
-				if (strcmp(option_args[OPT_ARG_MODEM_VERSION],"V21")==0)
-					session.version=VERSION_V21;
-				else if (strcmp(option_args[OPT_ARG_MODEM_VERSION],"V23")==0)
-					session.version=VERSION_V23;
-				else if (strcmp(option_args[OPT_ARG_MODEM_VERSION],"Bell103")==0)
-					session.version=VERSION_BELL103;
-				else if (strcmp(option_args[OPT_ARG_MODEM_VERSION],"V22")==0)
-					session.version=VERSION_V22;
-				else if (strcmp(option_args[OPT_ARG_MODEM_VERSION],"V22bis")==0)
-					session.version=VERSION_V22BIS;
-			}
-		}
-		
-		if (ast_test_flag(&options, OPT_LSB_FIRST)) {
-			if (ast_test_flag(&options, OPT_MSB_FIRST)) {
-				ast_log(LOG_ERROR, "Please only set l or m flag, not both.\n");
-				return -1;
-			}
-			session.lsb=1;
-		}
-		
-		if (ast_test_flag(&options, OPT_DATABITS)) {
-			if (!ast_strlen_zero(option_args[OPT_ARG_DATABITS])) {
-				session.databits = atoi(option_args[OPT_ARG_DATABITS]);
-				
-				if ((session.databits<5) || (session.databits>8)) {
-					ast_log(LOG_ERROR, "Only 5-8 data bits are supported.\n");
-					return -1;
-				}
-			}
-		}
-		
-		if (ast_test_flag(&options, OPT_STOPBITS)) {
-			if (!ast_strlen_zero(option_args[OPT_ARG_STOPBITS])) {
-				session.stopbits = atoi(option_args[OPT_ARG_STOPBITS]);
-				if ((session.stopbits<1) || (session.stopbits>2)) {
-					ast_log(LOG_ERROR, "Only 1-2 stop bits are supported.\n");
-					return -1;
-				}
-			}
-		}
-		
-		if (ast_test_flag(&options, OPT_ULM_HEADER)) {
-			session.ulmheader = 1;
-		}
-		if (ast_test_flag(&options, OPT_NULL)) {
-			session.sendnull = 1;
-		}
-		if (ast_test_flag(&options, OPT_ANSWERER)) {
-			if (ast_test_flag(&options, OPT_CALLER)) {
-				ast_log(LOG_ERROR, "Please only set c or a flag, not both.\n");
-				return -1;
-			}
-			session.caller = 0;
-		}
-		
 	}
-	
-	res=softmodem_communicate(&session);
-	
+
+	sm_options_defaults(&opts);
+	if (!ast_strlen_zero(args.options)) {
+		if (ast_app_parse_options(additional_options, &flags, option_args, args.options)) {
+			ast_log(LOG_ERROR, "Could not parse the options '%s'\n", args.options);
+			return -1;
+		}
+		if (ast_test_flag(&flags, OPT_ANSWER) && ast_test_flag(&flags, OPT_CALL)) {
+			ast_log(LOG_ERROR, "Please only set c or a flag, not both.\n");
+			return -1;
+		}
+		if (ast_test_flag(&flags, OPT_LSB_FIRST) && ast_test_flag(&flags, OPT_MSB_FIRST)) {
+			ast_log(LOG_ERROR, "Please only set l or m flag, not both.\n");
+			return -1;
+		}
+		for (size_t i = 0; i < ARRAY_LEN(option_table); i++) {
+			const char *arg;
+
+			if (!ast_test_flag(&flags, option_table[i].flag))
+				continue;
+			arg = option_table[i].arg >= 0 ? option_args[option_table[i].arg] : NULL;
+			if (option_table[i].arg >= 0 && ast_strlen_zero(arg))
+				continue;
+			if (!sm_options_apply(&opts, option_table[i].letter, arg, err, sizeof(err))) {
+				ast_log(LOG_ERROR, "%s\n", err);
+				return -1;
+			}
+		}
+		if (ast_test_flag(&flags, OPT_RX_CUTOFF))
+			ast_log(LOG_NOTICE, "Softmodem: the r() option no longer does anything\n");
+	}
+	if (!sm_options_check(&opts, err, sizeof(err))) {
+		ast_log(LOG_ERROR, "%s\n", err);
+		return -1;
+	}
+
+	/* Who dialled whom decides which end of the handshake we are. A
+	 * channel Asterisk placed - Originate, a call file, the called side of
+	 * Dial - is a call we made; anything else, one we are answering. */
+	if (opts.role == SM_ROLE_AUTO) {
+		calling = ast_test_flag(ast_channel_flags(chan), AST_FLAG_OUTGOING) ||
+			  ast_test_flag(ast_channel_flags(chan), AST_FLAG_ORIGINATED);
+	} else {
+		calling = (opts.role == SM_ROLE_CALLING);
+	}
+
+	/* Nothing may start until the call is answered: an answer tone into
+	 * ringback, or training against it, is the classic way to "connect" to
+	 * nobody. */
+	if (ast_channel_state(chan) != AST_STATE_UP) {
+		if (ast_answer(chan)) {
+			ast_log(LOG_WARNING, "Could not answer channel '%s'\n", ast_channel_name(chan));
+			return -1;
+		}
+	}
+
+	/* The server first: a call it cannot be connected to is not worth
+	 * training for. */
+	sock = sm_connect_tcp(host, port, SOFTMODEM_CONNECT_TIMEOUT_MS, err, sizeof(err));
+	if (sock < 0) {
+		ast_log(LOG_WARNING, "Softmodem on %s: %s\n", ast_channel_name(chan), err);
+		set_result(chan, "CONNECTFAILED", NULL);
+		return 0;
+	}
+
+	read_fmt = ao2_bump(ast_channel_readformat(chan));
+	write_fmt = ao2_bump(ast_channel_writeformat(chan));
+	if (ast_set_read_format(chan, ast_format_slin) < 0 || ast_set_write_format(chan, ast_format_slin) < 0) {
+		ast_log(LOG_WARNING, "Unable to set %s to signed linear\n", ast_channel_name(chan));
+		close(sock);
+		set_result(chan, "ERROR", NULL);
+		goto restore;
+	}
+	check_codec(chan);
+	set_dsp(chan, 0);
+
+	sm_init(DEBUG_ATLEAST(1) ? DM_LOG_DEBUG : DM_LOG_WARN);
+	b = sm_bridge_create(&opts, calling, sock, ast_channel_name(chan));
+	if (b == NULL) {
+		close(sock);
+		set_result(chan, "ERROR", NULL);
+		goto restore_dsp;
+	}
+	ast_verb(3, "Softmodem on %s: %s modem, up to %s%s, connected to %s port %d\n", ast_channel_name(chan),
+		 calling ? "calling" : "answering", opts.modulation, opts.step_down ? " and falling back" : " only",
+		 host, port);
+
+	res = softmodem_run(chan, b);
+	{
+		sm_status_t st;
+
+		sm_bridge_status(b, &st);
+		ast_verb(3, "Softmodem on %s: %s after %s%s%s, %llu bytes sent and %llu received\n",
+			 ast_channel_name(chan), sm_end_name(sm_bridge_end(b)), st.connected ? st.modulation : "no carrier",
+			 st.connected ? " " : "", st.connected ? st.protocol : "",
+			 (unsigned long long) st.bytes_to_line, (unsigned long long) st.bytes_from_line);
+	}
+	/* Even for a channel that has hung up: an h extension can still read them. */
+	set_result(chan, sm_end_name(sm_bridge_end(b)), b);
+	sm_bridge_destroy(b);
+
+restore_dsp:
+	if (res == 0)
+		set_dsp(chan, 1);
+restore:
+	if (res == 0 && read_fmt && ast_set_read_format(chan, read_fmt) < 0)
+		ast_log(LOG_WARNING, "Unable to restore read format on '%s'\n", ast_channel_name(chan));
+	if (res == 0 && write_fmt && ast_set_write_format(chan, write_fmt) < 0)
+		ast_log(LOG_WARNING, "Unable to restore write format on '%s'\n", ast_channel_name(chan));
+	ao2_cleanup(read_fmt);
+	ao2_cleanup(write_fmt);
 	return res;
 }
 
+static int unload_module(void)
+{
+	int res = ast_unregister_application(app);
 
-
-static int unload_module(void) {
-	return ast_unregister_application(app);
+	sm_log_set_sink(NULL, NULL);
+	return res;
 }
 
-static int load_module(void) {
-	return ast_register_application_xml(app, softmodem_exec);
+static int load_module(void)
+{
+	sm_log_set_sink(ast_sink, ast_enabled);
+	sm_init(DM_LOG_WARN);
+	return ast_register_application_xml(app, softmodem_exec) ? AST_MODULE_LOAD_DECLINE : AST_MODULE_LOAD_SUCCESS;
 }
 
-
-AST_MODULE_INFO_STANDARD_EXTENDED(ASTERISK_GPL_KEY, "Softmodem v22");
+AST_MODULE_INFO_STANDARD_EXTENDED(ASTERISK_GPL_KEY, "Softmodem: V.34, V.32bis, V.22bis, V.21, Bell 103 and V.23 data modem");

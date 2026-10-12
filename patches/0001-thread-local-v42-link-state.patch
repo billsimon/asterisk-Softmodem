@@ -1,0 +1,83 @@
+Make the state datamodem keeps outside its per-call structures thread-local.
+
+datamodem runs one call at a time, so the vendored V.42 keeps some link
+state in plain globals: why a link went down, how many damaged frames
+arrived, which ADP the far end sent, the detection state (dm_neg, whose
+idle_run steers detection itself), and the side table of what spandsp's
+v42_state_t has no room for (dm_xid). Asterisk runs a modem per channel,
+concurrently, each on its own channel thread, and every access to these is
+from the thread pumping that channel's audio - so thread-local storage gives
+each call its own copy with no other change in behaviour. The test hooks
+beside them stay global: they are set from the environment, the same for
+every call.
+
+--- a/src/modem.c	2026-10-12 10:21:54
++++ b/src/modem.c	2026-10-12 10:30:09
+@@ -115,11 +115,11 @@
+ 
+ #if defined(DATAMODEM_VENDORED_V42)
+ /* See third_party/spandsp-v42. */
+-extern char dm_v42_disconnect_cause[80];
++extern __thread char dm_v42_disconnect_cause[80];
+ extern int dm_v42_reconnect(v42_state_t *s);
+ extern int dm_v42_refuse_sabme;
+-extern unsigned dm_v42_fcs_errors;
+-extern int dm_v42_adp_no_ec;
++extern __thread unsigned dm_v42_fcs_errors;
++extern __thread int dm_v42_adp_no_ec;
+ extern int dm_v42_answer_no_ec;
+ extern int dm_v42_no_xid;
+ extern int dm_v42_xid_done(const v42_state_t *s);
+--- a/third_party/spandsp-v42/v42.c	2026-10-12 10:21:54
++++ b/third_party/spandsp-v42/v42.c	2026-10-12 10:30:09
+@@ -276,7 +276,10 @@
+    process, so a single global will not do. A slot is taken by a context's
+    first lookup and given back when it is freed - see dm_xid_release(). */
+ #define DM_XID_SLOTS 8
+-static struct
++/* app_softmodem: per thread, as each Asterisk channel's V.42 context lives
++   and dies on its channel's thread, and two channels must not race for a
++   slot. */
++static __thread struct
+ {
+     const v42_state_t *s;
+     int done;
+@@ -644,7 +647,7 @@
+    to "the far end answered our SABME with a point-blank refusal". Telling
+    them apart from the outside is impossible, and they call for different
+    responses. */
+-char dm_v42_disconnect_cause[80] = "";
++__thread char dm_v42_disconnect_cause[80] = "";
+ 
+ /* datamodem: test hook. Refuse the first N SABMEs with a DM response, which
+    is what real far ends in the field do and what no spandsp ever does - two
+@@ -657,7 +660,7 @@
+    without a word, so a far end that is answering perfectly well over a path
+    that is mangling its answers looks identical to one that is saying nothing.
+    The difference matters more than anything else in a failed negotiation. */
+-unsigned dm_v42_fcs_errors = 0;
++__thread unsigned dm_v42_fcs_errors = 0;
+ 
+ /* datamodem: which Answerer Detection Pattern came back.
+    Table 3/V.42 defines two, and they mean opposite things:
+@@ -673,7 +676,7 @@
+    DM - which is the correct response to a request it already declined.
+    Detection appears to succeed, establishment is refused every single time,
+    and nothing anywhere says why. */
+-int dm_v42_adp_no_ec = 0;
++__thread int dm_v42_adp_no_ec = 0;
+ 
+ /* datamodem: test hook - make the answering end send the "no error-correcting
+    protocol desired" ADP. Two spandsp ends only ever send the other one.
+@@ -781,7 +784,10 @@
+    the demodulator still settling. The bit window is circular for the same
+    reason - what gets dumped is the last of the stream, not the first. */
+ #define DM_BITWIN 256
+-static struct
++/* app_softmodem: per thread, as for dm_xid above. idle_run steers detection
++   itself, and two channels detecting at once would count each other's
++   ones. */
++static __thread struct
+ {
+     unsigned first_bad, gap1_bad, second_bad, gap2_bad, cycles_ok;
+     int first_common, second_common;

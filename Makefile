@@ -40,6 +40,9 @@ else
 # -Bsymbolic: our V.22bis and V.42, not any libspandsp another module has
 # already loaded, are the ones our own code calls.
 MODULE_LDFLAGS = -shared -Wl,-Bsymbolic -Wl,--as-needed
+# Asterisk's strings.h puts "static int force_inline", which gcc's -Wextra
+# objects to in every module that includes it.
+AST_CFLAGS = -Wno-old-style-declaration
 endif
 LIBS = $(SPANDSP_LIBS) -lm -pthread
 

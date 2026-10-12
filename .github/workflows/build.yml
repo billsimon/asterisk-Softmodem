@@ -1,5 +1,6 @@
 # Tests, then app_softmodem.so built against each of the three newest
-# releases of Asterisk 20, 22 and 23 (Linux x86_64), one artifact per release.
+# releases of Asterisk 20, 22 and 23 (Linux x86_64), one artifact per release;
+# and against the Asterisk FreePBX 16 runs, for the older systems it runs on.
 #
 # The releases are looked up on downloads.asterisk.org at run time
 # (tools/asterisk-releases.py), so a new one is picked up without editing
@@ -8,6 +9,11 @@
 # menuselect's default options, so the module loads into an Asterisk built
 # with the defaults; one built with others (DEBUG_THREADS, say) declines it
 # and wants it built against its own headers.
+#
+# Those are built on Ubuntu 24.04 and need its glibc (2.38) and a system
+# libspandsp.so.2. The FreePBX 16 build instead runs in a CentOS 7 container
+# (tools/build-el7.sh): glibc 2.17, so Sangoma Linux 7 and Debian 10 and 11
+# load it, with spandsp linked in.
 name: Build
 
 on:
@@ -98,5 +104,30 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: app_softmodem-asterisk-${{ matrix.asterisk }}-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+
+  # The newest Asterisk FreePBX 16 offers, for the systems it runs on.
+  freepbx16:
+    name: asterisk-${{ matrix.asterisk }}-el7 (FreePBX 16)
+    needs: test
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        asterisk: ['20.17.0']
+    steps:
+      - uses: actions/checkout@v7
+
+      # In a step rather than as the job's container: the actions themselves
+      # need a newer glibc than CentOS 7 has.
+      - name: Build in a CentOS 7 container
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src quay.io/pypa/manylinux2014_x86_64 \
+            tools/build-el7.sh "${{ matrix.asterisk }}" dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: app_softmodem-asterisk-${{ matrix.asterisk }}-el7-x86_64
           path: dist/
           if-no-files-found: error

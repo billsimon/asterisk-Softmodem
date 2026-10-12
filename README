@@ -277,6 +277,12 @@
 	the artifacts load into an Asterisk built with the defaults; for one
 	built otherwise, build the module against its own headers.
 
+	Those artifacts need Ubuntu 24.04's glibc (2.38) and a system spandsp.
+	One more is built for FreePBX 16, against Asterisk 20.17.0, the newest
+	it offers: in a CentOS 7 container (tools/build-el7.sh), so that it
+	needs no glibc newer than 2.17 and loads on Sangoma Linux 7 and on
+	Debian 10 and 11, with spandsp linked into the module.
+
 
  Authors
 -------------------------------------------------------------------------------

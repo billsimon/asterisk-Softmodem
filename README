@@ -268,6 +268,15 @@
 		or ../datamodem/build/datamodem). A few minutes; see the top of
 		tests/asterisk/run.sh.
 
+	GitHub Actions (.github/workflows/build.yml) runs make test on Ubuntu,
+	then builds app_softmodem.so against each of the three newest releases
+	of Asterisk 20, 22 and 23, one artifact each. The releases are looked
+	up when it runs (tools/asterisk-releases.py), and each build needs only
+	that release's headers (tools/asterisk-headers.sh), not a built
+	Asterisk. Those headers carry menuselect's default build options, so
+	the artifacts load into an Asterisk built with the defaults; for one
+	built otherwise, build the module against its own headers.
+
 
  Authors
 -------------------------------------------------------------------------------

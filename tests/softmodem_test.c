@@ -33,6 +33,7 @@
 #include <inttypes.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1454,6 +1455,10 @@ static void unit_connect(void)
 
 int main(int argc, char **argv)
 {
+	/* Asterisk ignores SIGPIPE, and so must we: a test server writing to a
+	 * bridge that has just hung up gets EPIPE, not killed - Linux has no
+	 * SO_NOSIGPIPE to ask for that per socket. */
+	signal(SIGPIPE, SIG_IGN);
 	g_verbose = getenv("SOFTMODEM_TEST_VERBOSE") != NULL;
 	g_filters = argv + 1;
 	g_nfilters = argc - 1;

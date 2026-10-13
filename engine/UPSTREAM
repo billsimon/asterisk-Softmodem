@@ -1,0 +1,2 @@
+datamodem e947e7daf3b42657e6396a383421fd3aa273c836 (origin/main)
+synced 2026-10-12T14:30:09Z by tools/sync-datamodem.sh; patches: ./0001-thread-local-v42-link-state.patch ./0002-v34-probe-table-once.patch 

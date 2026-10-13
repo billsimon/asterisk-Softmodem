@@ -1,0 +1,178 @@
+# Tests, then app_softmodem.so built against each of the three newest
+# releases of Asterisk 20, 22 and 23 (Linux x86_64), one artifact per release;
+# and against the Asterisk FreePBX 16 runs, for the older systems it runs on.
+#
+# The releases are looked up on downloads.asterisk.org at run time
+# (tools/asterisk-releases.py), so a new one is picked up without editing
+# this file; the weekly run is for that. Each build uses only the release's
+# headers (tools/asterisk-headers.sh) - Asterisk itself is not built - with
+# menuselect's default options, so the module loads into an Asterisk built
+# with the defaults; one built with others (DEBUG_THREADS, say) declines it
+# and wants it built against its own headers.
+#
+# Those are built on Ubuntu 24.04 and need its glibc (2.38) and a system
+# libspandsp.so.2. The FreePBX 16 build instead runs in a CentOS 7 container
+# (tools/build-el7.sh): glibc 2.17, so Sangoma Linux 7 and Debian 10 and 11
+# load it, with spandsp linked in.
+#
+# A tag starting with v also publishes every build as a GitHub release.
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ASTERISK_MAJORS: '20 22 23'
+  RELEASES_EACH: 3
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install spandsp
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libspandsp-dev libtiff-dev
+
+      - name: make test
+        run: make test
+
+  versions:
+    runs-on: ubuntu-24.04
+    outputs:
+      asterisk: ${{ steps.list.outputs.asterisk }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Find the newest Asterisk releases
+        id: list
+        run: |
+          list=$(tools/asterisk-releases.py --count "$RELEASES_EACH" $ASTERISK_MAJORS)
+          echo "asterisk=$list" >> "$GITHUB_OUTPUT"
+          echo "Building against: $list" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: asterisk-${{ matrix.asterisk }}
+    needs: [test, versions]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        asterisk: ${{ fromJSON(needs.versions.outputs.asterisk) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config \
+            libspandsp-dev libtiff-dev libedit-dev libjansson-dev libxml2-dev libsqlite3-dev uuid-dev
+
+      # A release's headers never change; configure is most of the time.
+      - name: Cache Asterisk ${{ matrix.asterisk }} headers
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: asterisk-src/asterisk-${{ matrix.asterisk }}/include
+          key: asterisk-headers-${{ matrix.asterisk }}-ubuntu-24.04-${{ hashFiles('tools/asterisk-headers.sh') }}
+
+      - name: Prepare Asterisk ${{ matrix.asterisk }} headers
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: tools/asterisk-headers.sh "${{ matrix.asterisk }}" asterisk-src
+
+      - name: Build app_softmodem.so
+        run: |
+          make ASTERISK_INCLUDE="$PWD/asterisk-src/asterisk-${{ matrix.asterisk }}/include"
+          file app_softmodem.so
+          # Built against these headers, and carrying their build options.
+          grep -o 'AST_BUILDOPT_SUM "[^"]*"' "asterisk-src/asterisk-${{ matrix.asterisk }}/include/asterisk/buildopts.h"
+          mkdir -p dist
+          cp app_softmodem.so dist/
+          cp README dist/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: app_softmodem-asterisk-${{ matrix.asterisk }}-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+
+  # The newest Asterisk FreePBX 16 offers, for the systems it runs on.
+  freepbx16:
+    name: asterisk-${{ matrix.asterisk }}-el7 (FreePBX 16)
+    needs: test
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        asterisk: ['20.17.0']
+    steps:
+      - uses: actions/checkout@v7
+
+      # In a step rather than as the job's container: the actions themselves
+      # need a newer glibc than CentOS 7 has.
+      - name: Build in a CentOS 7 container
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src quay.io/pypa/manylinux2014_x86_64 \
+            tools/build-el7.sh "${{ matrix.asterisk }}" dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: app_softmodem-asterisk-${{ matrix.asterisk }}-el7-x86_64
+          path: dist/
+          if-no-files-found: error
+
+  # On a v* tag: every build above, as a tarball on a release of that name.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, freepbx16]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Package
+        run: |
+          mkdir release
+          for d in artifacts/app_softmodem-*; do
+            tar -czf "release/$(basename "$d").tar.gz" -C "$d" app_softmodem.so README
+          done
+          cd release
+          sha256sum *.tar.gz > SHA256SUMS
+          ls -l
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'EOF'
+          app_softmodem.so for Asterisk, one tarball for each release it was built against.
+          Pick the one for your Asterisk - the same release, or failing that the same major version.
+
+          - `...-linux-x86_64`: built on Ubuntu 24.04. Needs glibc 2.38 or newer and spandsp's
+            shared library (`libspandsp.so.2`) installed.
+          - `...-el7-x86_64`: for FreePBX 16 (Asterisk 20.17.0). Needs only glibc 2.17, so it loads on
+            Sangoma Linux 7 and Debian 10 and 11; spandsp is built in.
+
+          Each is built with Asterisk's default build options and loads into an Asterisk built with
+          them. To install, copy `app_softmodem.so` into Asterisk's modules directory (usually
+          `/usr/lib/asterisk/modules` or `/usr/lib64/asterisk/modules`) and run
+          `module load app_softmodem.so`.
+          EOF
+          gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --notes-file notes.md --generate-notes --verify-tag

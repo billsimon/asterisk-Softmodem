@@ -1,99 +1,291 @@
-
- app_softmodem.c - V.21/V.22/V.23 modem for Asterisk
+ app_softmodem.c - a data modem for Asterisk
 ===============================================================================
 
-	This Asterisk application provides a softmodem for Asterisk. It supports
-	the FSK standards V.23, V.21 and Bell 103, but also V.22 and V.22bis.
-	Byte-size, number of stopbits and bitordering is configurable.
-	A TCP connection comparable to a Telnet session is established to the
-	host specified.
+	Softmodem() puts a data modem on an Asterisk channel and connects what
+	it carries to a TCP server, as a telnet client would. It speaks
+
+		V.34      up to 33600 bps
+		V.32bis   14400, 12000, 9600, 7200, 4800
+		V.32      9600, 4800
+		V.22bis   2400, 1200
+		V.22      1200
+		V.21      300
+		Bell 103  300
+		V.23      1200/75 (videotex)
+
+	with V.42 error correction and V.42bis compression when the far end
+	will, and works both ways round: answering a modem that dialled in (a
+	BBS, a videotex centre) and calling one that Asterisk dialled out to.
+
+	At its defaults it does what a modem with factory settings does. As the
+	answering modem it offers V.34 (ANSam and V.8), and to a caller that does
+	not answer that, offers V.22bis, V.32bis, V.21 and Bell 103 in turn until
+	one of them is taken up. As the calling modem it listens to what answers
+	and runs whatever that is. So one dialplan line serves every kind of
+	modem from a 300 bps acoustic coupler to a 33600 bps V.34.
+
+	The data pump is datamodem's (https://github.com/billsimon/datamodem): its
+	V.32, V.32bis and V.34, its patched copies of spandsp's V.22bis and V.42,
+	and what it learned about modems on VoIP paths. It is vendored in
+	engine/ - see "The engine" below.
 
 
  Dependencies and Installation
 -------------------------------------------------------------------------------
 
-	app_softmodem.c depends on the spandsp library
-	(http://www.soft-switch.org/).
-	
-	It is tested and working with Asterisk 13.
-	
-	To compile put app_softmodem.c in the apps/ dir of your Asterisk source.
-	Compile with 'make apps'.
-	
-	To use do a 'make install' on your asterisk source or copy
-	apps/app_softmodem.so into your asterisk module directory
-	(/lib/asterisk/mosules).
+	Needs the spandsp library (http://www.soft-switch.org/) and its headers,
+	the libtiff headers spandsp's include, and the headers of the Asterisk it
+	is for (the asterisk-dev package, or 'make install-headers' in an
+	Asterisk source tree). Built and tested with Asterisk 20; it uses
+	nothing newer than Asterisk 16 has, but has not been tried there.
+
+	It builds outside the Asterisk source tree:
+
+		make ASTERISK_INCLUDE=/usr/include
+		make install ASTERISK_MODULES_DIR=/usr/lib/asterisk/modules
+		asterisk -rx "module load app_softmodem.so"
+
+	ASTERISK_INCLUDE is the directory holding asterisk.h; spandsp is found
+	with pkg-config, or set SPANDSP_CFLAGS and SPANDSP_LIBS.
 
 
  Dialplan
 -------------------------------------------------------------------------------
 
-	exten => btx,1,Answer()
-	exten => btx,n,Softmodem(host, port, options)
-	exten => btx,n,Hangup()
-	
-	Without any arguments the application acts as a V.22bis modem and connects to a
-	Telnet server (port 23) on localhost.
-	
-	Options are:
-	        c: This is the calling modem (default).
-		a: This is the answering modem.
-		r(...): rx cutoff (dBi, float, default: -35)
-		t(...): tx power (dBi, float, default: -28)
-		v(...): modem version (default: V22bis):
-				V21        - 300/300 baud
-				V23        - 1200/75 baud
-				Bell103    - 300/300 baud
-				V22        - 1200/1200 baud
-				V22bis     - 2400/2400 baud
-		l or m: least or most significant bit first (default: l)
-		d(...): amount of data bits (5-8, default: 8)
-		s(...): amount of stop bits (1-2, default: 1)
-		u:      Send Ulm Relay Protocol header to Telnet server
-		n:      Send NULL-Byte to modem after carrier detection (Btx specific)
-	
-	To act as a "Btx Vermittlungsstelle" (German videotex system) using V.23, 8 data bits, 1 stop bit and sending a NULL byte upon carrier detection and connecting to a "twistedUlm" server on port 8289 (thus sending the ULM header):
-	
-	exten => 190,1,Softmodem(localhost, 8289, v(V23)ld(8)s(1)un)
-	
-	The modem seems to work fine with VOIP as long as you use a codec like G.711
-	(alaw/ulaw). Please deactivate any echo cancellation you might use.
+	Softmodem([host[,port[,options]]])
+
+	host and port are the TCP server, localhost and 23 if not given. The
+	call is answered if it is not already up.
+
+	A modem that dials in, to a BBS on port 2323:
+
+		exten => 5550100,1,Softmodem(bbs.example.com,2323)
+		 same => n,Hangup()
+
+	Dialling out to a modem: originate a call that runs Softmodem once it
+	is answered - from the CLI, AMI or a call file -
+
+		channel originate PJSIP/5551234@trunk application Softmodem bbs.example.com,23
+
+	or into a context that does:
+
+		[modem-out]
+		exten => s,1,Softmodem(bbs.example.com,23)
+
+		channel originate PJSIP/5551234@trunk extension s@modem-out
+
+	The call ends when the far end's carrier goes or the server closes the
+	connection - once the server's last words have gone down the line.
+
+	Calling or answering
+
+	Without a or c, Softmodem answers, unless the channel is one Asterisk
+	placed - originated (CLI, AMI, a call file) or the called side of Dial -
+	in which case it calls. So the same dialplan works for calls in and out;
+	a and c are there for anything unusual.
+
+	Options
+
+		a          This is the answering modem (the far end called us).
+		c          This is the calling modem (we called the far end).
+		v(...)     The fastest modulation to try, falling back from there:
+		             V34 (default), V32bis, V32, V22bis, V22, V21, Bell103,
+		             or V23 (1200/75), which nothing falls back to or from
+		             and so has to be asked for.
+		f          Fixed: only the modulation v() names, no falling back.
+		b(...)     The highest bit rate to offer, e.g. b(2400).
+		e(...)     V.42 error correction: detect (default: when the far end
+		             will), off, or require. V.21, Bell 103 and V.23 never
+		             run V.42.
+		k          No V.42bis compression.
+		d(...)     Data bits, 5-8 (default 8).
+		p(...)     Parity: none (default), even or odd.
+		s(...)     Stop bits, 1-2 (default 1).
+		l or m     Least or most significant bit first (default l, which
+		             is what every standard modem does).
+		t(...)     Transmit level in dBm0 (default -13).
+		g(...)     Guard tone for an answering V.22bis modem: 550 or 1800.
+		w(...)     Hang up if the modems have not trained in this many
+		             seconds (default 45).
+		u          Send the server an Ulm Relay Protocol header (Btx).
+		n          Send a NUL to the modem once connected (Btx).
+		r(...)     Ignored; accepted so that old dialplans still run.
+
+	Channel variables, set when Softmodem returns
+
+		SOFTMODEM_RESULT          SERVERCLOSED, CARRIERLOST, HANGUP,
+		                          NOCARRIER (never trained), UNSTABLE (kept
+		                          retraining), CONNECTFAILED (no server),
+		                          SOCKETERROR or ERROR
+		SOFTMODEM_MODULATION      what ran, e.g. v32bis
+		SOFTMODEM_RATE            bit rate received at
+		SOFTMODEM_TX_RATE         bit rate sent at (they differ for V.23, and
+		                          can for V.34)
+		SOFTMODEM_PROTOCOL        async, V.42 or V.42/V.42bis
+		SOFTMODEM_BYTES_SENT      characters sent down the line
+		SOFTMODEM_BYTES_RECEIVED  characters received from it
+
+	A calling Softmodem tells its server "CONNECTED" (CR LF) when the link
+	comes up, as it always has.
 
 
-
- Btx, the Ulm Relay Protocol, general description of operation
+ The audio path
 -------------------------------------------------------------------------------
 
-	After the softmodem picks up the line a TCP connection to the specified host 
-	and port is established, the call is dropped when this wasn't successfull.
-	
-	When the "n" option is specified a NULL byte is send to the caller upon the detection of a carrier signal from the caller. The Btx system in Germany did this to request the caller's identification.
-	
-	With the "u" option specified a header is send to the TCP server at this
-	point. The header consists of some "name: value" pairs, separated by a CR+LF newline, terminated	by a double newline.
-	
-	At the moment this header looks like (for V.23):
+	A modem needs the audio exactly as the far end sent it. Use G.711 (ulaw
+	or alaw) end to end - anything compressed destroys it, and Softmodem
+	logs a warning if the channel is not G.711 - and switch off whatever
+	listens to or alters the audio. For PJSIP:
+
+		[modem-trunk]
+		type = endpoint
+		allow = !all,ulaw,alaw
+		dtmf_mode = rfc4733      ; not inband or auto: no DTMF detector on the audio
+		fax_detect = no
+		direct_media = no
+
+	and no JITTERBUFFER() on the channel. Softmodem switches off digit and
+	fax detection and echo cancellation itself on channels that can be told
+	to (DAHDI). V.32 and V.34 cancel their own echo, and say so to the
+	network with phase reversals in the answer tone.
+
+	Asterisk hands Softmodem the far end's audio as it arrives, so the modem
+	is clocked by it: a frame goes out for each frame that comes in, lost
+	packets (from their RTP sequence numbers) are filled in as such, and if
+	nothing arrives for 60 ms Softmodem keeps transmitting on its own clock,
+	so the far end goes on hearing a carrier, and drops whatever arrives late
+	for the time it covered. Short dropouts cost some bits, which V.42 puts
+	back; long ones make V.32 and V.34 retrain.
+
+	When a call will not connect, 'core set verbose 3' shows each step of
+	the handshake - which tones were heard, what was offered, what trained
+	at what SNR - and 'core set debug 1 app_softmodem.so' a great deal
+	more. Starting Asterisk with DATAMODEM_RECORD=/some/dir/call in its
+	environment records every call's audio to call.<channel>.wav: what came
+	in on the left, what went out on the right.
+
+
+ Btx, the Ulm Relay Protocol
+-------------------------------------------------------------------------------
+
+	To act as a "Btx Vermittlungsstelle" (German videotex system) using
+	V.23, 8 data bits, 1 stop bit, sending a NUL upon connecting and
+	connecting to a "twistedUlm" server on port 8289 (thus sending the ULM
+	header):
+
+		exten => 190,1,Softmodem(localhost,8289,v(V23)ld(8)s(1)un)
+
+	When the "n" option is specified a NUL is sent to the caller once the
+	modems have connected; the Btx system in Germany did this to request
+	the caller's identification. An answering modem on an async link waits
+	a second first, so that the calling modem - which is still training or
+	holding its carrier when the answering one connects - does not miss it;
+	the same goes for anything the server says first.
+
+	With the "u" option a header is sent to the TCP server at that point:
+	"name: value" pairs separated by CR LF, ending with an empty line. For
+	V.23 it looks like
+
 		Version: 1
-		TXspeed: 120
-		RXspeed: 7.5
-	Speeds are in bytes-per-second and may be used by the server to estimate
-	the length of the transmission.
-	
-	After the header all data received from the terminal is put onto the socket
-	and all data received from the socket is put on the line.
-	
-	The line is hung up when the server drops the connection, just as the
-	connection to the server is dropped when the line is hung up.
-	
-	You find my "Ulm Relay Protocol" server here:
-	http://github.com/proquar/twistedUlm
+		TXspeed: 120.00
+		RXspeed: 7.50
+
+	Speeds are in characters per second, from the rates the modems agreed,
+	and may be used by the server to estimate the length of a transmission.
+	After the header, everything from the terminal is put on the socket and
+	everything from the socket on the line.
+
+	The "twistedUlm" server: http://github.com/proquar/twistedUlm
 	It sends CEPT T/CD 6-1 encoded data, which it retrieves from a webserver,
 	to the terminal and provides the characteristic BTX look-and-feel.
-	
-	You may also be interested in:
-		http://runningserver.com/?page=runningserver.content.thelab.bildschirmtrix
-	And you find a description of BTX MarkupLanguage here:
-		http://runningserver.com/?page=runningserver.content.thelab.mikropad
+
+
+ Upgrading from the old Softmodem
+-------------------------------------------------------------------------------
+
+	Old dialplans run unchanged, with these differences:
+
+	- Without v(), Softmodem now works out the far end's modulation, from
+	  V.34 down, instead of running V.22bis only. v() names where to start;
+	  add f to run only that one, as before.
+	- Without a or c, Softmodem answers calls that came in and calls on
+	  calls Asterisk placed; it used to call on both.
+	- V.42 and V.42bis run when the far end does them. e(off) for a raw
+	  async link as before.
+	- t() is the transmit level in dBm0 and defaults to -13, the usual level
+	  for a modem; the old default was -28. r() does nothing.
+	- V.22bis carries data. The V.22bis in most packaged spandsp builds
+	  trains and then delivers a constant 0x55; Softmodem now uses the
+	  working one vendored in engine/.
+
+
+ The engine
+-------------------------------------------------------------------------------
+
+	engine/ is datamodem's modem engine, copied by tools/sync-datamodem.sh
+	from a datamodem checkout and recorded in engine/UPSTREAM. Nothing in it
+	is edited by hand: the changes Asterisk needs are in patches/, which the
+	script applies -
+
+		0001  V.42's per-link state, thread-local: Asterisk runs a modem per
+		      channel, at the same time, each on its channel's thread.
+		0002  V.34's probe table built once with pthread_once, so that two
+		      channels starting V.34 together cannot see it half built.
+
+	datamodem runs one call at a time and needs neither. To bring in a newer
+	datamodem - from its main branch rather than whatever the checkout has
+	in it:
+
+		git -C ../datamodem fetch
+		tools/sync-datamodem.sh ../datamodem origin/main
+		make test
+
+	datamodem's DEVNOTES.md explains how each modulation works, why its
+	thresholds are what they are, and what it has been tested against.
+
+
+ Tests
+-------------------------------------------------------------------------------
+
+	make test
+
+		Softmodem without Asterisk: the same bridge and clock the module
+		runs, against a second modem over a simulated RTP path, with real
+		sockets for the servers. Every modulation, calling and answering,
+		with the far end fixed to it and Softmodem at its defaults; V.42's
+		fall backs; framing; the Btx options; G.711, delay, lost packets and
+		stalls; every way a call ends; and four calls at once on four
+		threads. A couple of seconds. build/softmodem-test takes words to
+		select tests by name; SOFTMODEM_TEST_VERBOSE=1 shows the engine's
+		log as it goes.
+
+	make test-asterisk ASTERISK=/usr/sbin/asterisk
+
+		A real Asterisk with this module loaded and PJSIP on loopback, and
+		datamodem as the modem at the other end of real SIP calls: dialling
+		in at every modulation, and being dialled at every modulation with
+		"channel originate". Needs python3 and a datamodem binary (DATAMODEM,
+		or ../datamodem/build/datamodem). A few minutes; see the top of
+		tests/asterisk/run.sh.
+
+	GitHub Actions (.github/workflows/build.yml) runs make test on Ubuntu,
+	then builds app_softmodem.so against each of the three newest releases
+	of Asterisk 20, 22 and 23, one artifact each. The releases are looked
+	up when it runs (tools/asterisk-releases.py), and each build needs only
+	that release's headers (tools/asterisk-headers.sh), not a built
+	Asterisk. Those headers carry menuselect's default build options, so
+	the artifacts load into an Asterisk built with the defaults; for one
+	built otherwise, build the module against its own headers.
+
+	Those artifacts need Ubuntu 24.04's glibc (2.38) and a system spandsp.
+	One more is built for FreePBX 16, against Asterisk 20.17.0, the newest
+	it offers: in a CentOS 7 container (tools/build-el7.sh), so that it
+	needs no glibc newer than 2.17 and loads on Sangoma Linux 7 and on
+	Debian 10 and 11, with spandsp linked into the module.
+
+	Pushing a tag that starts with v (v2.0.0, say) runs the same pipeline
+	and publishes a GitHub release of that name, with each build as a
+	tarball - app_softmodem.so and this README - and their SHA256SUMS.
 
 
  Authors
@@ -102,14 +294,12 @@
 	Christian Groeger <code@proquari.at>
 
 	Modified by Bill Simon <bill@simonics.com> for USA-based defaults and
-	options to be the calling or receiving modem
-	
+	options to be the calling or receiving modem, and to run datamodem's
+	engine
+
 	Based on code by:
 	Dmitry Andrianov <asterisk@dima.spb.ru>
 	Steve Underwood <steveu@coppice.org>
-
-
-
 
 
 

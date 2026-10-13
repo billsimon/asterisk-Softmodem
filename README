@@ -283,6 +283,10 @@
 	needs no glibc newer than 2.17 and loads on Sangoma Linux 7 and on
 	Debian 10 and 11, with spandsp linked into the module.
 
+	Pushing a tag that starts with v (v2.0.0, say) runs the same pipeline
+	and publishes a GitHub release of that name, with each build as a
+	tarball - app_softmodem.so and this README - and their SHA256SUMS.
+
 
  Authors
 -------------------------------------------------------------------------------

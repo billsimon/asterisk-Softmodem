@@ -14,6 +14,8 @@
 # libspandsp.so.2. The FreePBX 16 build instead runs in a CentOS 7 container
 # (tools/build-el7.sh): glibc 2.17, so Sangoma Linux 7 and Debian 10 and 11
 # load it, with spandsp linked in.
+#
+# A tag starting with v also publishes every build as a GitHub release.
 name: Build
 
 on:
@@ -131,3 +133,46 @@ jobs:
           name: app_softmodem-asterisk-${{ matrix.asterisk }}-el7-x86_64
           path: dist/
           if-no-files-found: error
+
+  # On a v* tag: every build above, as a tarball on a release of that name.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, freepbx16]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Package
+        run: |
+          mkdir release
+          for d in artifacts/app_softmodem-*; do
+            tar -czf "release/$(basename "$d").tar.gz" -C "$d" app_softmodem.so README
+          done
+          cd release
+          sha256sum *.tar.gz > SHA256SUMS
+          ls -l
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'EOF'
+          app_softmodem.so for Asterisk, one tarball for each release it was built against.
+          Pick the one for your Asterisk - the same release, or failing that the same major version.
+
+          - `...-linux-x86_64`: built on Ubuntu 24.04. Needs glibc 2.38 or newer and spandsp's
+            shared library (`libspandsp.so.2`) installed.
+          - `...-el7-x86_64`: for FreePBX 16 (Asterisk 20.17.0). Needs only glibc 2.17, so it loads on
+            Sangoma Linux 7 and Debian 10 and 11; spandsp is built in.
+
+          Each is built with Asterisk's default build options and loads into an Asterisk built with
+          them. To install, copy `app_softmodem.so` into Asterisk's modules directory (usually
+          `/usr/lib/asterisk/modules` or `/usr/lib64/asterisk/modules`) and run
+          `module load app_softmodem.so`.
+          EOF
+          gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --notes-file notes.md --generate-notes --verify-tag
